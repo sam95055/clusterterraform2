@@ -1,0 +1,124 @@
+variable "cluster_name" {}
+variable "cluster_endpoint" {}
+variable "oidc_provider_arn" {}
+variable "vpc_id" {}
+variable "subnet_ids" {
+  type = list(string)
+}
+variable "tags" {
+  type = map(string)
+}
+variable "resource_prefix" {
+  default = "Test-ABC"
+}
+
+
+provider "helm" {
+  kubernetes {
+    config_path = "~/.kube/config"  # or use `exec` for EKS IAM auth
+  }
+}
+
+# Karpenter IAM role (for the controller)
+resource "aws_iam_role" "karpenter_controller" {
+  name               = "${var.resource_prefix}-karpenter-controller"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = {
+        Federated = var.oidc_provider_arn
+      },
+      Action = "sts:AssumeRoleWithWebIdentity",
+      Condition = {
+        StringEquals = {
+          "${replace(var.oidc_provider_arn, "arn:aws:iam::", "")}:sub" = "system:serviceaccount:karpenter:karpenter"
+        }
+      }
+    }]
+  })
+  tags = var.tags
+}
+
+# Attach Karpenter controller policy
+resource "aws_iam_policy" "karpenter_controller_policy" {
+  name        = "${var.resource_prefix}-karpenter-policy"
+  description = "Policy for Karpenter controller"
+  policy      = file("${path.module}/karpenter-policy.json") # Use official or custom policy
+  tags        = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "attach_policy" {
+  role       = aws_iam_role.karpenter_controller.name
+  policy_arn = aws_iam_policy.karpenter_controller_policy.arn
+}
+
+# Helm chart to deploy Karpenter
+resource "helm_release" "karpenter" {
+  name       = "karpenter"
+  namespace  = "karpenter"
+  repository = "https://charts.karpenter.sh"
+  chart      = "karpenter"
+  version    = "v0.36.1"
+
+  create_namespace = true
+
+  set {
+    name  = "controller.clusterName"
+    value = var.cluster_name
+  }
+
+  set {
+    name  = "controller.clusterEndpoint"
+    value = var.cluster_endpoint
+  }
+
+  set {
+    name  = "controller.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = aws_iam_role.karpenter_controller.arn
+  }
+
+  tags = var.tags
+}
+
+
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": [
+        "ec2:CreateLaunchTemplate",
+        "ec2:RunInstances",
+        "ec2:CreateFleet",
+        "ec2:TerminateInstances",
+        "ec2:Describe*",
+        "ssm:GetParameter"
+      ],
+      "Effect": "Allow",
+      "Resource": "*"
+    }
+  ]
+}
+
+
+
+
+apiVersion: karpenter.sh/v1beta1
+kind: Provisioner
+metadata:
+  name: default
+spec:
+  requirements:
+    - key: "node.kubernetes.io/instance-type"
+      operator: In
+      values: ["t3.medium", "t3.large"]
+  provider:
+    subnetSelector:
+      karpenter.sh/discovery: "<your-cluster-name>"
+    securityGroupSelector:
+      karpenter.sh/discovery: "<your-cluster-name>"
+  ttlSecondsAfterEmpty: 30
+
+
+
