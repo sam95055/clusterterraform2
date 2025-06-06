@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# Detect the second block device (non-root)
+SWAP_DEV=$(lsblk -dpno NAME | grep -vE 'nvme0n1|xvda' | head -n 1)
+
+if [ -b "$SWAP_DEV" ]; then
+  echo "Using $SWAP_DEV for swap"
+  sudo swapoff -a
+  sudo mkswap "$SWAP_DEV"
+  sudo swapon "$SWAP_DEV"
+  echo "$SWAP_DEV none swap sw 0 0" | sudo tee -a /etc/fstab
+else
+  echo "No secondary disk found for swap"
+fi
+
+user_data = base64encode(<<-EOF
+  #!/bin/bash
+
+  # Detect and use second block device as swap
+  SWAP_DEV=$(lsblk -dpno NAME | grep -vE 'nvme0n1|xvda' | head -n 1)
+  if [ -b "$SWAP_DEV" ]; then
+    swapoff -a
+    mkswap "$SWAP_DEV"
+    swapon "$SWAP_DEV"
+    echo "$SWAP_DEV none swap sw 0 0" >> /etc/fstab
+  fi
+
+  # Bootstrap EKS node
+  /etc/eks/bootstrap.sh my-cluster --kubelet-extra-args '--node-labels=env=dev'
+EOF
+)
