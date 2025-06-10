@@ -1,0 +1,291 @@
+# main.tf
+
+# Configure the AWS provider
+provider "aws" {
+  region = "ap-south-1" # Set your desired AWS region here
+}
+
+# --- Data Sources for Existing Network Infrastructure ---
+
+# Fetch details of your existing VPC
+data "aws_vpc" "selected" {
+  id = "vpc-0123456789abcdef0" # <--- IMPORTANT: REPLACE WITH YOUR EXISTING VPC ID
+}
+
+# Fetch details of your existing private subnets
+# These subnets MUST be tagged correctly for Karpenter to discover them.
+# Ensure your private subnets have these tags:
+#   "karpenter.sh/discovery": "<YOUR_CLUSTER_NAME>"
+#   "kubernetes.io/cluster/<YOUR_CLUSTER_NAME>": "owned"
+data "aws_subnets" "private" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.selected.id]
+  }
+  filter {
+    name   = "tag:karpenter.sh/discovery"
+    values = ["my-eks-cluster"] # <--- IMPORTANT: REPLACE WITH YOUR DESIRED CLUSTER NAME
+  }
+  filter {
+    name   = "tag:kubernetes.io/cluster/my-eks-cluster" # <--- IMPORTANT: REPLACE WITH YOUR DESIRED CLUSTER NAME
+    values = ["owned"]
+  }
+}
+
+# --- EKS Cluster Definition ---
+
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 19.0" # Use a compatible version, check Terraform Registry for latest
+
+  cluster_name    = "my-eks-cluster" # <--- IMPORTANT: REPLACE WITH YOUR DESIRED CLUSTER NAME
+  cluster_version = "1.28"           # Your desired Kubernetes version
+
+  vpc_id                   = data.aws_vpc.selected.id
+  subnet_ids               = data.aws_subnets.private.ids # EKS control plane runs in private subnets
+  enable_irsa              = true
+  manage_aws_auth          = true
+
+  # Tag the EKS primary security group for Karpenter discovery
+  cluster_security_group_tags = {
+    "karpenter.sh/discovery" = "my-eks-cluster" # <--- IMPORTANT: MATCH YOUR CLUSTER NAME
+  }
+
+  # --- AWS Managed Node Groups ---
+  # These are stable node groups that you manage directly, distinct from Karpenter.
+
+  eks_managed_node_groups = {
+    # Node group specifically for the Karpenter controller and essential EKS add-ons
+    # It's a best practice to run Karpenter itself on a dedicated, stable node group.
+    karpenter_controller_nodes = {
+      instance_types = ["t3.medium"] # Choose instance types suitable for control plane components
+      min_size       = 1
+      max_size       = 2
+      desired_size   = 1
+      disk_size      = 20
+      
+      # USER DATA FOR MANAGED NODE GROUP: karpenter_controller_nodes
+      # This script runs early during the EC2 instance boot, before EKS bootstraps.
+      pre_bootstrap_user_data = <<-EOT
+        #!/bin/bash
+        echo "Executing user data for 'karpenter_controller_nodes' managed node group..."
+        sudo apt-get update
+        sudo apt-get install -y htop jq # Example: Install htop and jq utilities
+        echo "User data for 'karpenter_controller_nodes' complete!"
+      EOT
+    }
+
+    # An example of another managed node group for general-purpose workloads
+    general_purpose_nodes = {
+      instance_types = ["m5.large"] # Instance types for typical applications
+      min_size       = 1
+      max_size       = 3
+      desired_size   = 1
+      disk_size      = 50
+      labels = {
+        "nodegroup-type" = "general-purpose"
+      }
+      
+      # USER DATA FOR MANAGED NODE GROUP: general_purpose_nodes
+      # Customize this for your specific workload needs on these nodes.
+      pre_bootstrap_user_data = <<-EOT
+        #!/bin/bash
+        echo "Executing user data for 'general_purpose_nodes' managed node group..."
+        # Add your custom commands here, e.g.,
+        # configure specific kernel parameters, install logging agents, etc.
+        echo "User data for 'general_purpose_nodes' complete!"
+      EOT
+    }
+  }
+
+  tags = {
+    Project     = "KarpenterEKS"
+    Environment = "Dev"
+  }
+}
+
+# --- Kubernetes Providers ---
+# These providers allow Terraform to interact with your EKS cluster's API.
+
+data "aws_eks_cluster_auth" "my_cluster" {
+  name = module.eks.cluster_name
+}
+
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  token                  = data.aws_eks_cluster_auth.my_cluster.token
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    token                  = data.aws_eks_cluster_auth.my_cluster.token
+  }
+}
+
+# --- Karpenter Module (Installs Karpenter into EKS) ---
+
+module "karpenter" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~> 19.0" # Use a compatible version, check Terraform Registry for latest
+
+  cluster_name            = module.eks.cluster_name
+  irsa_oidc_provider_arn  = module.eks.oidc_provider_arn
+  irsa_namespace_service_accounts = ["karpenter:karpenter"] # Karpenter's service account
+
+  create_iam_role = true # Automatically creates the IAM role for Karpenter to provision nodes
+
+  tags = {
+    Environment = "Dev"
+    Project     = "KarpenterEKS"
+  }
+}
+
+# --- Karpenter NodePool and EC2NodeClass (Kubernetes Manifests) ---
+# These Kubernetes Custom Resources define *how* Karpenter provisions nodes.
+
+resource "kubernetes_manifest" "karpenter_nodepool" {
+  manifest = {
+    apiVersion = "karpenter.sh/v1beta1" # Check Karpenter documentation for the correct API version
+    kind       = "NodePool"
+    metadata = {
+      name = "default"
+    }
+    spec = {
+      template = {
+        spec = {
+          requirements = [
+            { key = "karpenter.sh/capacity-type", operator = "In", values = ["on-demand", "spot"] },
+            { key = "kubernetes.io/arch", operator = "In", values = ["amd64"] },
+            { key = "kubernetes.io/os", operator = "In", values = ["linux"] },
+            { key = "node.kubernetes.io/instance-type", operator = "In", values = ["m5.large", "c5.large", "r5.large", "t3.large"] } # Specify a range of suitable instance types
+          ]
+          nodeClassRef = {
+            name = "default"
+          }
+        }
+      }
+      limits = {
+        cpu = "1000" # Soft limit on total CPU for this NodePool (e.g., 1000 cores)
+      }
+      disruption = {
+        consolidationPolicy = "WhenUnderutilized" # Or "WhenEmpty"
+        expireAfter         = "720h"              # Nodes will be replaced after 30 days, good for refresh
+      }
+    }
+  }
+  depends_on = [module.karpenter] # Ensure Karpenter controller is deployed first
+}
+
+resource "kubernetes_manifest" "karpenter_ec2nodeclass" {
+  manifest = {
+    apiVersion = "karpenter.k8s.aws/v1beta1" # Check Karpenter documentation for the correct API version
+    kind       = "EC2NodeClass"
+    metadata = {
+      name = "default"
+    }
+    spec = {
+      amiFamily = "AL2" # Or "AL2023", "Bottlerocket", etc. Ensure compatible with your region/needs
+      role        = module.karpenter.instance_profile_name # IAM instance profile created by Karpenter module
+      subnetSelector = {
+        "karpenter.sh/discovery" = module.eks.cluster_name # Discovers subnets based on tag
+      }
+      securityGroupSelector = {
+        "karpenter.sh/discovery" = module.eks.cluster_name # Discovers security groups based on tag
+      }
+      tags = {
+        "Name"      = "karpenter-node-${module.eks.cluster_name}"
+        "CreatedBy" = "Karpenter"
+        "Env"       = "Dev"
+      }
+      
+      # USER DATA FOR KARPENTER-PROVISIONED NODES
+      # This script runs on the EC2 instances launched by Karpenter.
+      # It needs to be base64 encoded when provided in a Kubernetes manifest.
+      userData = base64encode(<<-EOT
+        #!/bin/bash
+        echo "Executing user data for Karpenter-provisioned node..."
+        # Add your custom commands here, e.g.,
+        # - Install specific monitoring agents or security tools
+        # - Configure host-level settings (e.g., /etc/sysctl.conf)
+        # - Mount additional volumes
+        echo "User data for Karpenter node complete!"
+      EOT
+      )
+
+      # Optional: Customize block device mappings or instance metadata options
+      # blockDeviceMappings = [{
+      #   deviceName = "/dev/xvda"
+      #   ebs = {
+      #     volumeSize = 20
+      #     volumeType = "gp3"
+      #     encrypted  = true
+      #   }
+      # }]
+      # instanceMetadataOptions = {
+      #   httpTokens   = "required" # Enforce IMDSv2 for enhanced security
+      #   httpPutResponseHopLimit = 2
+      # }
+    }
+  }
+  depends_on = [module.karpenter] # Ensure Karpenter controller is deployed first
+}
+
+# --- Example Deployment to Test Karpenter (Optional) ---
+# Scale this deployment up to see Karpenter provision new nodes.
+
+resource "kubernetes_deployment" "inflate" {
+  metadata {
+    name = "inflate"
+    labels = {
+      app = "inflate"
+    }
+  }
+  spec {
+    replicas = 0 # Start with 0. Scale this up (e.g., to 50) to trigger Karpenter.
+    selector {
+      match_labels = {
+        app = "inflate"
+      }
+    }
+    template {
+      metadata {
+        labels = {
+          app = "inflate"
+        }
+      }
+      spec {
+        container {
+          name  = "inflate"
+          image = "public.ecr.aws/eks-distro/kubernetes/pause:3.9"
+          resources {
+            requests = {
+              cpu    = "1"
+              memory = "1Gi"
+            }
+          }
+        }
+      }
+    }
+  }
+  depends_on = [
+    kubernetes_manifest.karpenter_nodepool,
+    kubernetes_manifest.karpenter_ec2nodeclass
+  ]
+}
+
+# --- Outputs ---
+
+output "eks_cluster_name" {
+  description = "The name of the EKS cluster"
+  value       = module.eks.cluster_name
+}
+
+output "kubeconfig_command" {
+  description = "Command to update your kubeconfig to connect to the new EKS cluster"
+  value       = "aws eks update-kubeconfig --name ${module.eks.cluster_name} --region ${data.aws_region.current.name}"
+}
+
+data "aws_region" "current" {}
