@@ -1,0 +1,207 @@
+# main.tf
+
+# 1. AWS Provider Configuration
+provider "aws" {
+  region = "ap-south-1" # Or your desired region, e.g., "us-east-1"
+}
+
+# 2. VPC Module (if you don't have an existing VPC)
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "my-eks-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["ap-south-1a", "ap-south-1b"] # Adjust as needed
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24"]
+
+  enable_nat_gateway = true
+
+  # Essential tags for Karpenter discovery
+  private_subnet_tags = {
+    "karpenter.sh/discovery" = "my-eks-cluster"
+  }
+}
+
+# 3. EKS Cluster Module
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 19.0" # Use a compatible version
+
+  cluster_name    = "my-eks-cluster"
+  cluster_version = "1.28" # Or your desired Kubernetes version
+
+  vpc_id                   = module.vpc.vpc_id
+  subnet_ids               = module.vpc.private_subnets # EKS control plane in private subnets
+  enable_irsa              = true
+  manage_aws_auth          = true
+
+  # Tag the EKS primary security group for Karpenter discovery
+  cluster_security_group_tags = {
+    "karpenter.sh/discovery" = "my-eks-cluster"
+  }
+
+  # Add a managed node group for Karpenter itself (often a small one)
+  # Karpenter deployment runs on this node group, and then it provisions
+  # dynamic nodes for other workloads.
+  eks_managed_node_groups = {
+    karpenter_nodes = {
+      instance_types = ["t3.medium"]
+      min_size       = 1
+      max_size       = 1
+      disk_size      = 20
+      desired_size   = 1
+      # Ensure these nodes are tagged for Karpenter's own operation if needed
+      # but often the module handles this for the EKS components.
+    }
+  }
+
+  # Fargate profiles can be used for Karpenter control plane if preferred
+  # fargate_profiles = {
+  #   karpenter = {
+  #     selectors = [
+  #       { namespace = "karpenter" }
+  #     ]
+  #   }
+  # }
+}
+
+# 4. Kubernetes Providers
+data "aws_eks_cluster_auth" "my_cluster" {
+  name = module.eks.cluster_name
+}
+
+provider "kubernetes" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  token                  = data.aws_eks_cluster_auth.my_cluster.token
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    token                  = data.aws_eks_cluster_auth.my_cluster.token
+  }
+}
+
+# 5. Karpenter Module
+module "karpenter" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~> 19.0" # Use a compatible version
+
+  cluster_name            = module.eks.cluster_name
+  irsa_oidc_provider_arn  = module.eks.oidc_provider_arn
+  irsa_namespace_service_accounts = ["karpenter:karpenter"] # Karpenter service account
+
+  # If you want the module to create the IAM role for Karpenter:
+  create_iam_role = true
+  # If you already have an IAM role, set create_iam_role = false and provide iam_role_arn
+
+  tags = {
+    Environment = "Dev"
+    Project     = "KarpenterEKS"
+  }
+}
+
+# 6. Karpenter Provisioner and AWSNodeTemplate (Kubernetes manifests)
+# These are Kubernetes resources managed by the Kubernetes provider
+resource "kubernetes_manifest" "karpenter_provisioner" {
+  manifest = {
+    apiVersion = "karpenter.sh/v1beta1" # Check Karpenter docs for latest API version
+    kind       = "NodePool"
+    metadata = {
+      name = "default"
+    }
+    spec = {
+      template = {
+        spec = {
+          requirements = [
+            { key = "karpenter.sh/capacity-type", operator = "In", values = ["on-demand", "spot"] },
+            { key = "kubernetes.io/arch", operator = "In", values = ["amd64"] },
+            { key = "kubernetes.io/os", operator = "In", values = ["linux"] },
+            # Example: restrict to certain instance families
+            { key = "node.kubernetes.io/instance-type", operator = "In", values = ["m5.large", "c5.large", "r5.large"] }
+          ]
+          nodeClassRef = {
+            name = "default"
+          }
+        }
+      }
+      limits = {
+        cpu = "1000" # Max CPU units for the nodepool
+      }
+      disruption = {
+        consolidationPolicy = "WhenUnderutilized"
+        expireAfter         = "720h" # Nodes expire after 30 days
+      }
+    }
+  }
+}
+
+resource "kubernetes_manifest" "karpenter_aws_node_template" {
+  manifest = {
+    apiVersion = "karpenter.k8s.aws/v1beta1" # Check Karpenter docs for latest API version
+    kind       = "EC2NodeClass"
+    metadata = {
+      name = "default"
+    }
+    spec = {
+      amiFamily = "AL2" # Or AL2023, Bottlerocket, etc.
+      role        = module.karpenter.instance_profile_name # Use the instance profile created by the Karpenter module
+      subnetSelector = {
+        "karpenter.sh/discovery" = module.eks.cluster_name
+      }
+      securityGroupSelector = {
+        "karpenter.sh/discovery" = module.eks.cluster_name
+      }
+      tags = {
+        "Name" = "karpenter-node-${module.eks.cluster_name}"
+      }
+      # Block device mappings, metadata options, etc. can be added here
+      # blockDeviceMappings = [{
+      #   deviceName = "/dev/xvda"
+      #   ebs = {
+      #     volumeSize = 20
+      #     volumeType = "gp3"
+      #   }
+      # }]
+    }
+  }
+}
+
+# Example deployment to test Karpenter (optional)
+resource "kubernetes_deployment" "inflate" {
+  metadata {
+    name = "inflate"
+  }
+  spec {
+    replicas = 0 # Start with 0, then scale up to test Karpenter
+    selector {
+      match_labels = {
+        app = "inflate"
+      }
+    }
+    template {
+      metadata {
+        labels = {
+          app = "inflate"
+        }
+      }
+      spec {
+        container {
+          name  = "inflate"
+          image = "public.ecr.aws/eks-distro/kubernetes/pause:3.9"
+          resources {
+            requests = {
+              cpu    = "1"
+              memory = "1Gi"
+            }
+          }
+        }
+      }
+    }
+  }
+}
